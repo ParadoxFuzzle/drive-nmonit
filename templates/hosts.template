@@ -1,0 +1,19 @@
+# =============================================================================
+# drive-nmonit — Cluster Node Hosts File Template
+# =============================================================================
+# Add entries like these to /etc/hosts on EVERY node in the cluster.
+# This ensures GlusterFS can resolve peer hostnames even without DNS.
+#
+# Usage:
+#   1. Assign static IPs to each node (or use DHCP reservations)
+#   2. Copy these entries to /etc/hosts on EVERY node
+#   3. Replace IPs and hostnames with your actual values
+# =============================================================================
+
+# --- Primary Node ---
+192.168.1.10    node-primary     node-primary.local
+
+# --- Slave Nodes ---
+192.168.1.11    node-slave-01    node-slave-01.local
+192.168.1.12    node-slave-02    node-slave-02.local
+192.168.1.13    node-slave-03    node-slave-03.local
