@@ -1,0 +1,1329 @@
+#!/usr/bin/env bash
+# =============================================================================
+# drive-nmonit — Interactive Management CLI
+# =============================================================================
+# A comprehensive interactive menu-driven wrapper that orchestrates ALL
+# drive-nmonit scripts. Provides a unified interface for cluster management.
+#
+# Usage:
+#   sudo ./drive-nmonit-cli                        # Interactive menu mode
+#   sudo ./drive-nmonit-cli status                 # Quick status overview
+#   sudo ./drive-nmonit-cli health                 # Run health check (human)
+#   sudo ./drive-nmonit-cli health --json          # Run health check (JSON)
+#   sudo ./drive-nmonit-cli install                # Install dependencies
+#   sudo ./drive-nmonit-cli setup-mergerfs         # Setup local pool
+#   sudo ./drive-nmonit-cli setup-gluster --init   # Init cluster
+#   sudo ./drive-nmonit-cli setup-gluster --join   # Join cluster
+#   sudo ./drive-nmonit-cli mount                  # Mount workspace
+#   sudo ./drive-nmonit-cli samba                  # Samba share setup
+#   sudo ./drive-nmonit-cli nfs                    # NFS export setup
+#   sudo ./drive-nmonit-cli tune                   # Performance tuning
+#   sudo ./drive-nmonit-cli dashboard              # Start web dashboard
+#   sudo ./drive-nmonit-cli logs                   # View logs
+# =============================================================================
+set -euo pipefail
+
+# --- Project paths ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="${SCRIPT_DIR}/scripts:${PATH}"
+
+# Source shared utilities
+source "${SCRIPT_DIR}/scripts/utils.sh"
+
+# --- Constants ---
+VERSION="1.0.0"
+POOL_MOUNT="/mnt/local-pool"
+WORKSPACE_MOUNT="/mnt/workspace"
+DRIVES_BASE="/mnt/drives"
+CONFIG_DIR="/etc/drive-nmonit"
+VOLUME_NAME="workspace"
+
+# --- Global flags ---
+DRY_RUN=false
+YES_MODE=false
+
+# Config file path
+DEFAULT_CONFIG="/etc/drive-nmonit/config"
+CUSTOM_CONFIG=""
+
+# =============================================================================
+# Terminal helpers
+# =============================================================================
+
+# Terminal control codes
+CLR_LINE="\033[K"
+SAVE_CURSOR="\033[s"
+RESTORE_CURSOR="\033[u"
+HIDE_CURSOR="\033[?25l"
+SHOW_CURSOR="\033[?25h"
+
+# Box drawing characters
+H_BAR="━"
+V_BAR="┃"
+TL="┏"
+TR="┓"
+BL="┗"
+BR="┛"
+TEE_L="┣"
+TEE_R="┫"
+TEE_T="┳"
+TEE_B="┻"
+CROSS="╋"
+DOT="•"
+ARROW="→"
+
+# =============================================================================
+# System state detection
+# =============================================================================
+
+# Detect state once and cache it for the session
+declare -A STATE
+
+detect_state() {
+    STATE[mergerfs_installed]=false
+    STATE[glusterd_installed]=false
+    STATE[gluster_installed]=false
+    STATE[samba_installed]=false
+    STATE[nfs_installed]=false
+    STATE[jq_installed]=false
+
+    command_exists mergerfs  && STATE[mergerfs_installed]=true
+    command_exists glusterd  && STATE[glusterd_installed]=true
+    command_exists gluster   && STATE[gluster_installed]=true
+    command_exists smbd || command_exists smb && STATE[samba_installed]=true
+    command_exists exportfs || command_exists nfsstat && STATE[nfs_installed]=true
+    command_exists jq       && STATE[jq_installed]=true
+
+    # Mount states
+    STATE[pool_mounted]=false
+    STATE[workspace_mounted]=false
+    mountpoint -q "$POOL_MOUNT" 2>/dev/null && STATE[pool_mounted]=true
+    mountpoint -q "$WORKSPACE_MOUNT" 2>/dev/null && STATE[workspace_mounted]=true
+
+    # GlusterFS volume state
+    STATE[volume_exists]=false
+    STATE[volume_running]=false
+    STATE[is_primary]=false
+    STATE[peer_count]=0
+
+    if [[ "${STATE[gluster_installed]}" == true ]]; then
+        if gluster volume info "$VOLUME_NAME" &>/dev/null; then
+            STATE[volume_exists]=true
+            local vol_status
+            vol_status=$(gluster volume info "$VOLUME_NAME" 2>/dev/null | grep -i "^Status:" | awk '{print $2}')
+            [[ "$vol_status" == "Started" ]] && STATE[volume_running]=true
+        fi
+
+        # Detect if this is primary (no primary.txt file means primary or standalone)
+        if [[ ! -f "${CONFIG_DIR}/gluster-primary.txt" ]]; then
+            STATE[is_primary]=true
+        fi
+
+        # Count peers
+        local peers
+        peers=$(gluster pool list 2>/dev/null | tail -n +2 | wc -l)
+        STATE[peer_count]=$peers
+    fi
+
+    # Detect drives
+    STATE[drive_count]=0
+    if [[ -d "$DRIVES_BASE" ]]; then
+        STATE[drive_count]=$(find "$DRIVES_BASE" -maxdepth 1 -type d | wc -l)
+        STATE[drive_count]=$(( STATE[drive_count] - 1 ))
+        [[ ${STATE[drive_count]} -lt 0 ]] && STATE[drive_count]=0
+    fi
+
+    # Dashboard running
+    STATE[dashboard_running]=false
+    if command_exists systemctl; then
+        systemctl is-active --quiet drive-nmonit-dashboard 2>/dev/null && STATE[dashboard_running]=true
+    fi
+    # Also check if port 8080 is listening
+    if command_exists ss; then
+        ss -tlnp 2>/dev/null | grep -q ":8080\\b" && STATE[dashboard_running]=true
+    fi
+}
+
+# =============================================================================
+# Pretty printer
+# =============================================================================
+
+print_box_header() {
+    local title="$1"
+    local width="${2:-60}"
+    local padding=$(( (width - ${#title} - 2) / 2 ))
+    [[ $padding -lt 1 ]] && padding=1
+
+    echo ""
+    echo -e "  ${BLUE}${TL}$(printf '━%.0s' $(seq 1 $width))${TR}${NC}"
+    printf "  ${BLUE}${V_BAR}${NC}%*s%s%*s${BLUE}${V_BAR}${NC}\n" $padding "" "$title" $padding ""
+    echo -e "  ${BLUE}${TEE_L}$(printf '━%.0s' $(seq 1 $width))${TEE_R}${NC}"
+}
+
+print_box_footer() {
+    local width="${1:-60}"
+    echo -e "  ${BLUE}${BL}$(printf '━%.0s' $(seq 1 $width))${BR}${NC}"
+}
+
+status_badge() {
+    local status="$1"
+    case "$status" in
+        healthy|yes|mounted|running|installed|active|connected)
+            echo -e "${GREEN}●${NC} ${status^}"
+            ;;
+        warning|degraded)
+            echo -e "${YELLOW}●${NC} ${status^}"
+            ;;
+        critical|no|unmounted|stopped|missing|inactive|disconnected)
+            echo -e "${RED}●${NC} ${status^}"
+            ;;
+        *)
+            echo -e "${BLUE}●${NC} ${status^}"
+            ;;
+    esac
+}
+
+print_status_row() {
+    local label="$1"
+    local status="$2"
+    local detail="${3:-}"
+    printf "  ${V_BAR} %-30s %-16b" "$label" "$(status_badge "$status")"
+    [[ -n "$detail" ]] && echo -e " ${detail}" || echo ""
+}
+
+print_info() {
+    echo -e "  ${BLUE}${ARROW}${NC} $*"
+}
+
+print_success() {
+    echo -e "  ${GREEN}✔${NC} $*"
+}
+
+print_warning() {
+    echo -e "  ${YELLOW}⚠${NC} $*"
+}
+
+print_error() {
+    echo -e "  ${RED}✘${NC} $*" >&2
+}
+
+# =============================================================================
+# Status dashboard
+# =============================================================================
+
+show_status() {
+    detect_state
+
+    clear 2>/dev/null || true
+    print_box_header "drive-nmonit v${VERSION} — Cluster Status" 62
+    echo ""
+
+    # --- Services ---
+    print_box_header "Services" 58
+    print_status_row "MergerFS"           "${STATE[mergerfs_installed]}" ""
+    print_status_row "GlusterFS daemon"   "${STATE[glusterd_installed]}" ""
+    print_status_row "GlusterFS CLI"      "${STATE[gluster_installed]}" ""
+    print_status_row "Samba/CIFS"         "${STATE[samba_installed]}" ""
+    print_status_row "NFS server"         "${STATE[nfs_installed]}" ""
+    print_status_row "jq (utility)"       "${STATE[jq_installed]}" ""
+
+    # --- Mounts ---
+    echo ""
+    print_box_header "Mounts" 58
+    print_status_row "Pool ($POOL_MOUNT)" "${STATE[pool_mounted]}" ""
+    print_status_row "Workspace ($WORKSPACE_MOUNT)" "${STATE[workspace_mounted]}" ""
+
+    local used_str=""
+    if [[ "${STATE[workspace_mounted]}" == true ]]; then
+        used_str=$(df -h "$WORKSPACE_MOUNT" 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')
+    elif [[ "${STATE[pool_mounted]}" == true ]]; then
+        used_str=$(df -h "$POOL_MOUNT" 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}')
+    fi
+    [[ -n "$used_str" ]] && print_info "Disk usage: ${used_str}"
+
+    # --- GlusterFS ---
+    echo ""
+    print_box_header "GlusterFS Volume" 58
+    if [[ "${STATE[volume_exists]}" == true ]]; then
+        local vol_type vol_status
+        vol_type=$(gluster volume info "$VOLUME_NAME" 2>/dev/null | grep -i "^Type:" | awk '{print $2}')
+        vol_status=$(gluster volume info "$VOLUME_NAME" 2>/dev/null | grep -i "^Status:" | awk '{print $2}')
+        print_status_row "Volume" "${vol_status,,}" "$VOLUME_NAME"
+        print_status_row "Type" "info" "$vol_type"
+        print_status_row "Peers" "${STATE[peer_count]}" ""
+        print_status_row "Role" "info" "$( [[ "${STATE[is_primary]}" == true ]] && echo 'Primary' || echo 'Slave' )"
+    else
+        print_status_row "Volume" "missing" "$VOLUME_NAME (not created)"
+    fi
+
+    # --- Drives ---
+    echo ""
+    print_box_header "Local Drives" 58
+    print_status_row "Managed drives" "${STATE[drive_count]}" ""
+
+    if [[ ${STATE[drive_count]} -gt 0 ]] && [[ "${STATE[pool_mounted]}" == true ]]; then
+        echo ""
+        local i=0
+        for dir in "$DRIVES_BASE"/*/; do
+            [[ -d "$dir" ]] || continue
+            i=$((i + 1))
+            local label=$(basename "$dir")
+            if mountpoint -q "$dir" 2>/dev/null; then
+                local dev_usage
+                dev_usage=$(df -h "$dir" 2>/dev/null | awk 'NR==2{printf "(%s of %s)", $3, $2}')
+                print_status_row "  ${i}. ${label}" "mounted" "$dev_usage"
+            else
+                print_status_row "  ${i}. ${label}" "unmounted" ""
+            fi
+        done
+    fi
+
+    # --- Dashboard ---
+    echo ""
+    print_box_header "Web Dashboard" 58
+    if [[ "${STATE[dashboard_running]}" == true ]]; then
+        print_status_row "Dashboard" "running" "http://$(hostname -I 2>/dev/null | awk '{print $1}'):8080"
+    else
+        print_status_row "Dashboard" "stopped" ""
+    fi
+
+    print_box_footer 62
+    echo ""
+
+    # Overall status
+    local overall="healthy"
+    if [[ "${STATE[workspace_mounted]}" != true ]] && [[ "${STATE[volume_exists]}" == true ]]; then
+        overall="warning"
+    fi
+    if [[ "${STATE[volume_exists]}" == true ]] && [[ "${STATE[volume_running]}" != true ]]; then
+        overall="critical"
+    fi
+
+    echo -e "  Overall cluster status: $(status_badge "$overall")"
+    echo ""
+}
+
+# =============================================================================
+# JSON status output
+# =============================================================================
+
+show_status_json() {
+    detect_state
+
+    local hostname ip vol_type vol_status overall usage_str dashboard_url drives_json
+
+    hostname=$(hostname 2>/dev/null || echo "unknown")
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "")
+
+    # Volume info from gluster
+    if [[ "${STATE[volume_exists]}" == true ]]; then
+        vol_type=$(gluster volume info "$VOLUME_NAME" 2>/dev/null | grep -i "^Type:" | awk '{print $2}')
+        vol_status=$(gluster volume info "$VOLUME_NAME" 2>/dev/null | grep -i "^Status:" | awk '{print $2}')
+    fi
+
+    # Disk usage
+    if [[ "${STATE[workspace_mounted]}" == true ]]; then
+        usage_str=$(df -h "$WORKSPACE_MOUNT" 2>/dev/null | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')
+    elif [[ "${STATE[pool_mounted]}" == true ]]; then
+        usage_str=$(df -h "$POOL_MOUNT" 2>/dev/null | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')
+    fi
+
+    # Dashboard URL
+    if [[ "${STATE[dashboard_running]}" == true ]] && [[ -n "$ip" ]]; then
+        dashboard_url="http://${ip}:8080"
+    fi
+
+    # Overall status
+    overall="healthy"
+    if [[ "${STATE[workspace_mounted]}" != true ]] && [[ "${STATE[volume_exists]}" == true ]]; then
+        overall="warning"
+    fi
+    if [[ "${STATE[volume_exists]}" == true ]] && [[ "${STATE[volume_running]}" != true ]]; then
+        overall="critical"
+    fi
+
+    # Drives details
+    drives_json=""
+    if [[ -d "$DRIVES_BASE" ]] && [[ ${STATE[drive_count]} -gt 0 ]]; then
+        local first=true
+        for dir in "$DRIVES_BASE"/*/; do
+            [[ -d "$dir" ]] || continue
+            local label=$(basename "$dir")
+            local mounted=false
+            local usage=""
+            if mountpoint -q "$dir" 2>/dev/null; then
+                mounted=true
+                usage=$(df -h "$dir" 2>/dev/null | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')
+            fi
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                drives_json+=","
+            fi
+            drives_json+="{\"label\":\"${label}\",\"mounted\":${mounted},\"usage\":\"${usage}\"}"
+        done
+    fi
+    [[ -n "$drives_json" ]] && drives_json=",\"drives\":{\"count\":${STATE[drive_count]},\"details\":[${drives_json}]}"
+
+    # Role string
+    local role="slave"
+    [[ "${STATE[is_primary]}" == true ]] && role="primary"
+
+    # Build JSON
+    local json
+    json="{\"version\":\"${VERSION}\",\"hostname\":\"${hostname}\""
+    json+=",\"services\":{\"mergerfs\":${STATE[mergerfs_installed]},\"glusterfs_daemon\":${STATE[glusterd_installed]},\"glusterfs_cli\":${STATE[gluster_installed]},\"samba\":${STATE[samba_installed]},\"nfs\":${STATE[nfs_installed]},\"jq\":${STATE[jq_installed]}}"
+    json+=",\"mounts\":{\"pool\":{\"path\":\"${POOL_MOUNT}\",\"mounted\":${STATE[pool_mounted]}},\"workspace\":{\"path\":\"${WORKSPACE_MOUNT}\",\"mounted\":${STATE[workspace_mounted]},\"usage\":\"${usage_str}\"}}"
+    json+=",\"glusterfs\":{\"volume_name\":\"${VOLUME_NAME}\",\"volume_exists\":${STATE[volume_exists]},\"volume_running\":${STATE[volume_running]},\"volume_type\":\"${vol_type}\",\"volume_status\":\"${vol_status}\",\"peers\":${STATE[peer_count]},\"is_primary\":${STATE[is_primary]},\"role\":\"${role}\"}"
+    json+="${drives_json}"
+    json+=",\"dashboard\":{\"running\":${STATE[dashboard_running]},\"url\":\"${dashboard_url}\"}"
+    json+=",\"overall_status\":\"${overall}\"}"
+
+    # Pretty-print with jq if available, otherwise output raw
+    if command_exists jq; then
+        echo "$json" | jq .
+    else
+        echo "$json"
+    fi
+}
+
+# =============================================================================
+# Dry-run helper
+# =============================================================================
+
+run_cmd() {
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${YELLOW}[DRY-RUN]${NC} $*"
+    else
+        "$@"
+    fi
+}
+
+print_dry_run_banner() {
+    if [[ "$DRY_RUN" == true ]]; then
+        echo ""
+        print_box_header "DRY-RUN MODE — Commands will be shown, not executed" 62
+        echo ""
+    fi
+}
+
+# =============================================================================
+# Auto-confirm helpers
+# =============================================================================
+
+# Skip "Press Enter to continue" pauses in --yes mode
+_pause() {
+    if [[ "$YES_MODE" != true ]]; then
+        read -r -p "Press Enter to continue... "
+    fi
+}
+
+# Auto-answer confirm prompts with the default in --yes mode
+_confirm() {
+    local prompt="$1"
+    local default="${2:-N}"  # N or Y
+    local response
+
+    if [[ "$YES_MODE" == true ]]; then
+        response="$default"
+        echo -e "  ${prompt} [${default,,}/${default^^}] → ${default}"
+    else
+        local prompt_char
+        if [[ "$default" == "Y" ]]; then
+            prompt_char="Y/n"
+        else
+            prompt_char="y/N"
+        fi
+        read -r -p "  ${prompt} [${prompt_char}]: " response
+        response="${response:-$default}"
+    fi
+
+    [[ "${response,,}" == "y" ]]
+}
+
+print_yes_banner() {
+    if [[ "$YES_MODE" == true ]]; then
+        echo ""
+        print_box_header "AUTO-CONFIRM MODE — All confirmations auto-answered" 62
+        echo ""
+    fi
+}
+
+# =============================================================================
+# Config validation
+# =============================================================================
+
+# Validate config values after sourcing the config file.
+# Resets invalid values to their defaults and prints warnings.
+validate_config() {
+    local config_path="${CUSTOM_CONFIG:-$DEFAULT_CONFIG}"
+
+    # --- DRY_RUN ---
+    if [[ -n "${DRY_RUN:-}" ]] && [[ "$DRY_RUN" != true ]] && [[ "$DRY_RUN" != false ]]; then
+        print_warning "Config: invalid DRY_RUN='${DRY_RUN}' in ${config_path} (expected true/false) — resetting to false"
+        DRY_RUN=false
+    fi
+
+    # --- YES_MODE ---
+    if [[ -n "${YES_MODE:-}" ]] && [[ "$YES_MODE" != true ]] && [[ "$YES_MODE" != false ]]; then
+        print_warning "Config: invalid YES_MODE='${YES_MODE}' in ${config_path} (expected true/false) — resetting to false"
+        YES_MODE=false
+    fi
+
+    # Note: unknown keys in the config file are silently ignored
+    # (they are regular bash variables sourced at top-level scope)
+}
+
+# =============================================================================
+# Action runners
+# =============================================================================
+
+run_install() {
+    print_info "Installing drive-nmonit dependencies..."
+    echo ""
+    run_cmd "${SCRIPT_DIR}/scripts/install-deps.sh"
+    local rc=$?
+    echo ""
+    if [[ $rc -eq 0 ]]; then
+        print_success "Dependencies installed"
+    else
+        print_error "Installation had issues (exit code: $rc)"
+    fi
+    echo ""
+    _pause
+}
+
+run_setup_mergerfs() {
+    require_root
+    print_info "Setting up mergerfs local drive pooling..."
+    echo ""
+    if [[ "${STATE[mergerfs_installed]}" != true ]]; then
+        print_warning "mergerfs is not installed. Run 'Install Dependencies' first."
+        echo ""
+        if _confirm "Install mergerfs now?" "Y"; then
+            run_install
+        else
+            _pause
+            return
+        fi
+    fi
+
+    run_cmd "${SCRIPT_DIR}/scripts/setup-mergerfs.sh"
+    echo ""
+    _pause
+}
+
+run_gluster_init() {
+    require_root
+    if [[ "${STATE[glusterd_installed]}" != true ]]; then
+        print_error "GlusterFS is not installed. Run 'Install Dependencies' first."
+        _pause
+        return
+    fi
+    if [[ "${STATE[pool_mounted]}" != true ]]; then
+        print_warning "MergerFS pool is not mounted. Run 'Setup Local Pool' first."
+        echo ""
+        if ! _confirm "Continue anyway?" "N"; then
+            return
+        fi
+    fi
+
+    run_cmd "${SCRIPT_DIR}/scripts/setup-glusterfs.sh" --init
+    echo ""
+    _pause
+}
+
+run_gluster_join() {
+    require_root
+    if [[ "${STATE[glusterd_installed]}" != true ]]; then
+        print_error "GlusterFS is not installed. Run 'Install Dependencies' first."
+        _pause
+        return
+    fi
+
+    local primary_ip=""
+    echo ""
+    read -r -p "Enter primary node IP address: " primary_ip
+    if [[ -z "$primary_ip" ]]; then
+        print_error "Primary IP is required"
+        _pause
+        return
+    fi
+
+    run_cmd "${SCRIPT_DIR}/scripts/setup-glusterfs.sh" --join "$primary_ip"
+    echo ""
+    _pause
+}
+
+run_mount() {
+    require_root
+    if [[ "${STATE[volume_exists]}" != true ]]; then
+        print_warning "GlusterFS volume '$VOLUME_NAME' does not exist yet."
+        print_info "Create it first via 'GlusterFS → Init Cluster' (on primary node)."
+        echo ""
+        if ! _confirm "Try mounting anyway?" "N"; then
+            return
+        fi
+    fi
+
+    run_cmd "${SCRIPT_DIR}/scripts/mount-all.sh"
+    echo ""
+    _pause
+}
+
+run_health_check() {
+    require_root
+    local extra_args=""
+    if [[ $# -gt 0 ]]; then
+        extra_args="$*"
+    fi
+
+    run_cmd "${SCRIPT_DIR}/scripts/health-check.sh" $extra_args
+    echo ""
+    if [[ $# -eq 0 ]]; then
+        _pause
+    fi
+}
+
+run_tuning() {
+    require_root
+    if [[ "${STATE[volume_exists]}" != true ]]; then
+        print_error "Volume '$VOLUME_NAME' does not exist. Create the cluster first."
+        _pause
+        return
+    fi
+
+    echo ""
+    echo "  Select a tuning profile:"
+    echo "    1)  Balanced    — Good all-around performance (recommended)"
+    echo "    2)  Throughput  — Large sequential reads/writes (media, backups)"
+    echo "    3)  Metadata    — Many small files, directory operations"
+    echo "    4)  Capacity    — Minimal memory usage, archival"
+    echo "    5)  Custom      — Interactive individual option selection"
+    echo "    s)  Skip / back"
+    echo ""
+    read -r -p "  Choice [1-5, s]: " profile_choice
+
+    local profile=""
+    case "$profile_choice" in
+        1|balanced)    profile="balanced" ;;
+        2|throughput)  profile="throughput" ;;
+        3|metadata)    profile="metadata" ;;
+        4|capacity)    profile="capacity" ;;
+        5|custom)      profile="custom" ;;
+        *)             return ;;
+    esac
+
+    echo ""
+    run_cmd "${SCRIPT_DIR}/scripts/tune-glusterfs.sh" "$VOLUME_NAME" "$profile"
+    echo ""
+    _pause
+}
+
+run_samba() {
+    require_root
+    echo ""
+    echo "  Samba/CIFS Share Setup"
+    echo "  ──────────────────────"
+    echo "  1)  Create authenticated share (Samba user required)"
+    echo "  2)  Create public share (guest access)"
+    echo "  3)  Remove workspace share"
+    echo "  4)  Back"
+    echo ""
+    read -r -p "  Choice [1-4]: " samba_choice
+
+    case "$samba_choice" in
+        1)
+            run_cmd "${SCRIPT_DIR}/scripts/setup-samba.sh" --auth
+            ;;
+        2)
+            run_cmd "${SCRIPT_DIR}/scripts/setup-samba.sh" --public
+            ;;
+        3)
+            run_cmd "${SCRIPT_DIR}/scripts/setup-samba.sh" --remove
+            ;;
+        *) return ;;
+    esac
+    echo ""
+    _pause
+}
+
+run_nfs() {
+    require_root
+    echo ""
+    read -r -p "  Client access CIDR (e.g., 10.0.0.0/24, or @all for any): " nfs_clients
+    nfs_clients="${nfs_clients:-@all}"
+    echo ""
+
+    echo "  Export mode:"
+    echo "  1)  Read-Write (default)"
+    echo "  2)  Read-Only"
+    echo "  3)  Remove export"
+    echo "  4)  Back"
+    echo ""
+    read -r -p "  Choice [1-4]: " nfs_mode
+
+    local extra_args=""
+    case "$nfs_mode" in
+        1) extra_args="--rw" ;;
+        2) extra_args="--ro" ;;
+        3)
+            run_cmd "${SCRIPT_DIR}/scripts/setup-nfs.sh" --remove
+            echo ""
+            _pause
+            return
+            ;;
+        *) return ;;
+    esac
+
+    run_cmd "${SCRIPT_DIR}/scripts/setup-nfs.sh" $extra_args --clients "$nfs_clients"
+    echo ""
+    _pause
+}
+
+run_dashboard() {
+    require_root
+    if [[ "${STATE[dashboard_running]}" == true ]]; then
+        print_warning "Dashboard is already running."
+        local ip
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        print_info "Dashboard: http://${ip}:8080"
+        echo ""
+        echo "  1)  Restart dashboard"
+        echo "  2)  Stop dashboard"
+        echo "  3)  Back"
+        echo ""
+        read -r -p "  Choice [1-3]: " dash_choice
+        case "$dash_choice" in
+            1)
+                systemctl stop drive-nmonit-dashboard 2>/dev/null || true
+                pkill -f "server.py" 2>/dev/null || true
+                sleep 1
+                ;;
+            2)
+                systemctl stop drive-nmonit-dashboard 2>/dev/null || true
+                pkill -f "server.py" 2>/dev/null || true
+                print_success "Dashboard stopped"
+                echo ""
+                _pause
+                return
+                ;;
+            *) return ;;
+        esac
+    fi
+
+    print_info "Starting dashboard server..."
+    echo ""
+    local nodes=""
+    if [[ ${STATE[peer_count]} -gt 0 ]]; then
+        # Try to get peer hostnames
+        local peer_hosts
+        peer_hosts=$(gluster pool list 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -v "localhost" | head -5 | tr '\n' ',' | sed 's/,$//')
+        if [[ -n "$peer_hosts" ]]; then
+            nodes=" --nodes ${peer_hosts}"
+        fi
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${YELLOW}[DRY-RUN]${NC} nohup ${SCRIPT_DIR}/dashboard/server.py${nodes} >/var/log/drive-nmonit-dashboard.log 2>&1 &"
+    else
+        # Start in background via nohup
+        nohup "${SCRIPT_DIR}/dashboard/server.py"${nodes} >/var/log/drive-nmonit-dashboard.log 2>&1 &
+        local pid=$!
+        sleep 2
+
+        if kill -0 "$pid" 2>/dev/null; then
+            local ip
+            ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+            print_success "Dashboard started on http://${ip}:8080"
+            print_info "PID: ${pid}"
+            print_info "Log: /var/log/drive-nmonit-dashboard.log"
+        else
+            print_error "Dashboard failed to start"
+        fi
+    fi
+    echo ""
+    _pause
+}
+
+run_logs() {
+    echo ""
+    echo "  View Logs"
+    echo "  ─────────"
+    echo "  1)  mergerfs pool logs"
+    echo "  2)  GlusterFS daemon logs"
+    echo "  3)  Mount workspace logs"
+    echo "  4)  Health check logs"
+    echo "  5)  Dashboard logs"
+    echo "  6)  All systemd logs (tail -50)"
+    echo "  7)  Back"
+    echo ""
+    read -r -p "  Choice [1-7]: " log_choice
+
+    local journal_args="-n 30 --no-pager"
+    case "$log_choice" in
+        1) journalctl -u mergerfs-pool.service $journal_args || print_warning "No mergerfs logs found" ;;
+        2) journalctl -u glusterd.service $journal_args || print_warning "No glusterd logs found" ;;
+        3) journalctl -u mnt-workspace.mount $journal_args || journalctl _COMM=mount.glusterfs $journal_args || print_warning "No workspace mount logs found" ;;
+        4) journalctl -u drive-nmonit-health.service $journal_args || print_warning "No health check logs found" ;;
+        5) cat /var/log/drive-nmonit-dashboard.log 2>/dev/null || print_warning "No dashboard logs found" ;;
+        6) journalctl -n 50 --no-pager -t drive-nmonit 2>/dev/null || journalctl -n 50 --no-pager | grep -i "nmonit" || print_warning "No drive-nmonit logs found" ;;
+        *) return ;;
+    esac
+    echo ""
+    _pause
+}
+
+run_node_management() {
+    require_root
+    if [[ "${STATE[is_primary]}" != true ]]; then
+        print_info "Node management must be run from the primary node."
+        echo ""
+        _pause
+        return
+    fi
+    if [[ "${STATE[gluster_installed]}" != true ]]; then
+        print_error "GlusterFS is not installed."
+        _pause
+        return
+    fi
+
+    echo ""
+    echo "  Node Management (Primary Only)"
+    echo "  ──────────────────────────────"
+    echo "  1)  Add a new node to the cluster"
+    echo "  2)  Remove a node from the cluster"
+    echo "  3)  Show current peers"
+    echo "  4)  Probe a peer"
+    echo "  5)  Back"
+    echo ""
+    read -r -p "  Choice [1-5]: " node_choice
+
+    case "$node_choice" in
+        1)
+            echo ""
+            read -r -p "  New node IP or hostname: " new_node
+            if [[ -n "$new_node" ]]; then
+                print_info "Probing ${new_node}..."
+                if gluster peer probe "$new_node"; then
+                    print_success "Node probed successfully"
+                    print_info "Now add the brick to the volume:"
+                    echo "    gluster volume add-brick $VOLUME_NAME ${new_node}:${POOL_MOUNT}"
+                    echo ""
+                    if _confirm "Add brick now? (requires pool on new node)" "N"; then
+                        gluster volume add-brick "$VOLUME_NAME" "${new_node}:${POOL_MOUNT}" && \
+                            print_success "Brick added" || \
+                            print_error "Failed to add brick (check that $POOL_MOUNT exists on the new node)"
+                    fi
+                else
+                    print_error "Failed to probe node"
+                fi
+            fi
+            ;;
+        2)
+            echo ""
+            echo "  Current peers:"
+            gluster pool list 2>/dev/null | tail -n +2 | awk '{print "    " NR ". " $1}'
+            echo ""
+            read -r -p "  Node IP or hostname to remove: " remove_node
+            if [[ -n "$remove_node" ]]; then
+                print_warning "This will detach the node. Data on its bricks may become inaccessible."
+                if _confirm "Continue?" "N"; then
+                    # First remove brick from volume
+                    if gluster volume info "$VOLUME_NAME" 2>/dev/null | grep -q "${remove_node}"; then
+                        print_info "Removing brick from volume..."
+                        gluster volume remove-brick "$VOLUME_NAME" "${remove_node}:${POOL_MOUNT}" force 2>/dev/null || \
+                            print_warning "Could not remove brick (volume may be distributed-only without replica)"
+                    fi
+                    # Detach peer
+                    gluster peer detach "$remove_node" --mode=script && \
+                        print_success "Node detached" || \
+                        print_error "Failed to detach node"
+                fi
+            fi
+            ;;
+        3)
+            echo ""
+            gluster pool list 2>/dev/null || print_warning "No peers found"
+            ;;
+        4)
+            echo ""
+            read -r -p "  Node IP or hostname: " probe_node
+            if [[ -n "$probe_node" ]]; then
+                gluster peer probe "$probe_node" && \
+                    print_success "Peer probed" || \
+                    print_error "Failed to probe peer"
+            fi
+            ;;
+        *) return ;;
+    esac
+    echo ""
+    _pause
+}
+
+run_system_info() {
+    echo ""
+    print_box_header "System Information" 58
+    echo ""
+    echo "  Hostname:     $(hostname)"
+    echo "  Kernel:       $(uname -r)"
+    echo "  OS:           $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "Unknown")"
+    echo "  CPU cores:    $(nproc 2>/dev/null || echo '?')"
+    echo "  Memory:       $(free -h 2>/dev/null | awk '/^Mem:/{print $2}') total"
+    echo "  Disk (/):     $(df -h / 2>/dev/null | awk 'NR==2{print $2}') total"
+    echo "  IP addrs:     $(hostname -I 2>/dev/null | head -1 || echo '?')"
+    echo "  Uptime:       $(uptime -p 2>/dev/null | sed 's/up //' || echo '?')"
+    echo ""
+    # Show disk layout (summary)
+    echo "  Block devices:"
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE 2>/dev/null | head -20 | while IFS= read -r line; do
+        echo "    ${line}"
+    done
+    print_box_footer 58
+    echo ""
+    _pause
+}
+
+# =============================================================================
+# Init config
+# =============================================================================
+
+run_init_config() {
+    echo ""
+    print_box_header "Initialize Persistent Configuration" 62
+    echo ""
+    echo "  This will create a config file at ${DEFAULT_CONFIG}"
+    echo "  with the settings you choose. Default flags stored here"
+    echo "  apply every time you run drive-nmonit-cli."
+    echo ""
+
+    local config_dir="$(dirname "$DEFAULT_CONFIG")"
+    ensure_dir "$config_dir"
+
+    # Check if config already exists
+    if [[ -f "$DEFAULT_CONFIG" ]] && ! _confirm "Config already exists. Overwrite?" "N"; then
+        print_info "Config initialization cancelled."
+        _pause
+        return
+    fi
+
+    # Prompt for settings
+    local opt_dry_run=""
+    local opt_yes_mode=""
+
+    if [[ "$YES_MODE" == true ]]; then
+        # Auto-confirm — use defaults (both disabled)
+        opt_dry_run="false"
+        opt_yes_mode="false"
+    else
+        echo "  ── Settings ──"
+        echo ""
+
+        echo "  Dry-run mode: preview commands without executing them."
+        read -r -p "  Enable? [y/N]: " reply
+        if [[ "${reply,,}" == "y" ]]; then
+            opt_dry_run="true"
+        else
+            opt_dry_run="false"
+        fi
+
+        echo ""
+        echo "  Auto-confirm mode: automatically answer all prompts"
+        echo "  with their defaults (skips 'Press Enter' pauses)."
+        read -r -p "  Enable? [y/N]: " reply
+        if [[ "${reply,,}" == "y" ]]; then
+            opt_yes_mode="true"
+        else
+            opt_yes_mode="false"
+        fi
+    fi
+
+    # Preview
+    echo ""
+    echo "  ── Config Preview ──"
+    echo ""
+    echo "  Path: ${DEFAULT_CONFIG}"
+    echo "  DRY_RUN=${opt_dry_run}"
+    echo "  YES_MODE=${opt_yes_mode}"
+    echo ""
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${YELLOW}[DRY-RUN]${NC} Config file would be written — skipping."
+        echo ""
+        _pause
+        return
+    fi
+
+    if ! _confirm "Write config file?" "Y"; then
+        print_info "Config initialization cancelled."
+        _pause
+        return
+    fi
+
+    # Write the config file
+    cat > "$DEFAULT_CONFIG" <<-CONFIGEOF
+# =============================================================================
+# drive-nmonit — Persistent Configuration File
+# =============================================================================
+# This file was generated by 'drive-nmonit-cli init-config'.
+# Valid values for each key are true/false (lowercase only).
+# Command-line flags override these values.
+# =============================================================================
+
+# Preview commands without executing them (--dry-run)
+DRY_RUN=${opt_dry_run}
+
+# Auto-answer prompts with defaults (--yes / --confirm / -y)
+YES_MODE=${opt_yes_mode}
+CONFIGEOF
+
+    echo ""
+    print_success "Config written to ${DEFAULT_CONFIG}"
+    print_info "Edit with: sudo nano ${DEFAULT_CONFIG}"
+    echo ""
+
+    # Reload config so it takes effect immediately
+    # shellcheck disable=SC1091
+    source "$DEFAULT_CONFIG" 2>/dev/null || true
+    validate_config
+
+    _pause
+}
+
+# =============================================================================
+# Help display
+# =============================================================================
+
+show_help() {
+    print_box_header "drive-nmonit-cli v${VERSION} — Command Reference" 67
+    echo ""
+    echo "  Usage: sudo ./drive-nmonit-cli [flags] [command]"
+    echo "         sudo ./drive-nmonit-cli                    # Interactive menu"
+    echo ""
+
+    # --- Setup Commands ---
+    echo "  ${GREEN}${TEE_T} Setup ${TEE_B}${NC}"
+    echo ""
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "install" "Install all dependencies"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "setup-mergerfs|pool" "Set up local drive pooling (mergerfs)"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "setup-gluster" "Set up GlusterFS cluster (see sub-flags below)"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "  --init" "Initialize cluster as primary node"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "  --join" "Join cluster as slave node"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "mount" "Mount GlusterFS workspace volume"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "tune|tuning" "Performance tuning (profile selection)"
+    echo ""
+
+    # --- Sharing Commands ---
+    echo "  ${YELLOW}${TEE_T} Network Shares ${TEE_B}${NC}"
+    echo ""
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "samba" "Samba/CIFS share setup"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "nfs" "NFS export setup"
+    echo ""
+
+    # --- Monitoring Commands ---
+    echo "  ${CYAN}${TEE_T} Monitoring ${TEE_B}${NC}"
+    echo ""
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "status|info" "Display cluster status overview (see sub-flags below)"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "  --json" "Machine-readable JSON status output"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "health" "Run health check (see sub-flags below)"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "  --json" "Machine-readable JSON health output"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "  --watch" "Live-updating health dashboard (5s refresh)"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "  --nagios" "Nagios/Icinga compatible output"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "  --quiet" "Only output warnings and errors"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "  --send-alert" "Send alert notifications on issues"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "dashboard|web" "Start/stop/restart web dashboard"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "logs" "View component logs (mergerfs, gluster, ...)"
+    echo ""
+
+    # --- Utility Commands ---
+    echo "  ${MAGENTA}${TEE_T} Utilities ${TEE_B}${NC}"
+    echo ""
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "system-info|sysinfo" "Show system information"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "init-config" "Write persistent config file interactively"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "help" "Show this help page"
+    echo ""
+
+    # --- Global Flags ---
+    echo "  ${BLUE}${TEE_T} Global Flags (place before command) ${TEE_B}${NC}"
+    echo ""
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "--dry-run" "Preview commands without executing them"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "--no-dry-run" "Override DRY_RUN=true from config file"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "--yes|--confirm|-y" "Auto-answer all confirmations"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "--config <path>" "Use custom config file path"
+    printf "  ${V_BAR} %-24s %-40s ${V_BAR}\n" "--help|-h" "Show this help page"
+    echo ""
+
+    # --- Examples ---
+    echo "  ${BLUE}${TEE_T} Examples ${TEE_B}${NC}"
+    echo ""
+    printf "  ${V_BAR} %-66s ${V_BAR}\n" "sudo ./drive-nmonit-cli                              # Interactive menu"
+    printf "  ${V_BAR} %-66s ${V_BAR}\n" "sudo ./drive-nmonit-cli health                       # Human-readable health"
+    printf "  ${V_BAR} %-66s ${V_BAR}\n" "sudo ./drive-nmonit-cli health --json                 # JSON health output"
+    printf "  ${V_BAR} %-66s ${V_BAR}\n" "sudo ./drive-nmonit-cli health --watch                # Live health dashboard"
+    printf "  ${V_BAR} %-66s ${V_BAR}\n" "sudo ./drive-nmonit-cli --dry-run --yes install        # Preview install"
+    printf "  ${V_BAR} %-66s ${V_BAR}\n" "sudo ./drive-nmonit-cli --config ./custom.cfg status   # Status with custom config"
+    printf "  ${V_BAR} %-66s ${V_BAR}\n" "sudo ./drive-nmonit-cli init-config                   # Create config interactively"
+    print_box_footer 67
+}
+
+# =============================================================================
+# Main menu
+# =============================================================================
+
+show_main_menu() {
+    detect_state
+
+    # Quick status first
+    show_status
+
+    echo "  ┌───────────────────────────────────────────────────────┐"
+    echo "  │                    MAIN MENU                         │"
+    echo "  ├───────────────────────────────────────────────────────┤"
+    echo "  │  1)  Install Dependencies                            │"
+    echo "  │  2)  Setup Local Pool (mergerfs)                     │"
+    echo "  │  3)  GlusterFS Cluster                               │"
+    echo "  │  4)  Mount Workspace                                 │"
+    echo "  │  5)  Performance Tuning                              │"
+    echo "  │  6)  Health Check                                    │"
+    echo "  │  7)  Network Shares                                  │"
+    echo "  │  8)  Web Dashboard                                   │"
+    echo "  │  9)  Node Management                                 │"
+    echo "  │  10) View Logs                                       │"
+    echo "  │  11) System Info                                     │"
+    echo "  │  12) Quick Status                                    │"
+    echo "  │  13) Init Config                                     │"
+    echo "  │                                                       │"
+    echo "  │  q)  Quit                                            │"
+    echo "  └───────────────────────────────────────────────────────┘"
+    echo ""
+    read -r -p "  Select option [1-13, q]: " choice
+    echo ""
+
+    case "$choice" in
+        1|install)      run_install ;;
+        2|pool|mergerfs) run_setup_mergerfs ;;
+        3|gluster|cluster)
+            echo "  GlusterFS Cluster"
+            echo "  ─────────────────"
+            echo "  1)  Init cluster (primary node)"
+            echo "  2)  Join cluster (slave node)"
+            echo "  3)  Back"
+            echo ""
+            read -r -p "  Choice [1-3]: " gc
+            case "$gc" in
+                1) run_gluster_init ;;
+                2) run_gluster_join ;;
+            esac
+            ;;
+        4|mount)         run_mount ;;
+        5|tune|tuning)   run_tuning ;;
+        6|health|check)  run_health_check ;;
+        7|share|samba|nfs)
+            echo "  Network Shares"
+            echo "  ──────────────"
+            echo "  1)  Samba/CIFS Setup"
+            echo "  2)  NFS Export Setup"
+            echo "  3)  Back"
+            echo ""
+            read -r -p "  Choice [1-3]: " sc
+            case "$sc" in
+                1) run_samba ;;
+                2) run_nfs ;;
+            esac
+            ;;
+        8|dashboard|web) run_dashboard ;;
+        9|node|nodes)    run_node_management ;;
+        10|logs)         run_logs ;;
+        11|info|sysinfo) run_system_info ;;
+        12|status)       show_status ;;
+        13|init|config|init-config) run_init_config ;;
+        q|quit|exit)     echo "  Goodbye!"; exit 0 ;;
+        *)               print_warning "Invalid option" ;;
+    esac
+}
+
+# =============================================================================
+# Command-line mode
+# =============================================================================
+
+cli_mode() {
+    local cmd="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        status|info)
+            if [[ "${1:-}" == "--json" ]]; then
+                show_status_json
+            else
+                show_status
+            fi
+            ;;
+        health)
+            require_root
+            run_health_check "$@"
+            ;;
+        install)
+            require_root
+            run_install
+            ;;
+        setup-mergerfs|pool)
+            require_root
+            run_setup_mergerfs
+            ;;
+        setup-gluster|gluster-init)
+            require_root
+            if [[ "${1:-}" == "--join" ]]; then
+                run_gluster_join
+            else
+                run_gluster_init
+            fi
+            ;;
+        gluster-join|join)
+            require_root
+            run_gluster_join
+            ;;
+        mount)
+            require_root
+            run_mount
+            ;;
+        tune|tuning)
+            require_root
+            run_tuning
+            ;;
+        samba)
+            require_root
+            run_samba
+            ;;
+        nfs)
+            require_root
+            run_nfs
+            ;;
+        dashboard|web)
+            require_root
+            run_dashboard
+            ;;
+        logs)
+            run_logs
+            ;;
+        system-info|sysinfo)
+            run_system_info
+            ;;
+        init-config)
+            run_init_config
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            echo "Unknown command: $cmd"
+            echo "Usage: $0 [command]"
+            echo "Run '$0 help' for a full command reference."
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# Main entry point
+# =============================================================================
+
+# Trap Ctrl+C for clean exit
+trap 'echo -e "${SHOW_CURSOR}"; exit 0' INT TERM
+
+# --- Config file loading (two-pass: first extract --config, then load config, then parse remaining flags) ---
+
+# First pass: extract --config from args (before loading config so CLI can override)
+SKIP_NEXT=false
+for arg in "$@"; do
+    if [[ "$SKIP_NEXT" == true ]]; then
+        CUSTOM_CONFIG="$arg"
+        SKIP_NEXT=false
+        continue
+    fi
+    case "$arg" in
+        --config=*)
+            CUSTOM_CONFIG="${arg#*=}"
+            ;;
+        --config)
+            SKIP_NEXT=true
+            ;;
+    esac
+done
+
+# Load config file (lowest priority — CLI flags below will override)
+if [[ -n "$CUSTOM_CONFIG" ]]; then
+    if [[ -f "$CUSTOM_CONFIG" ]]; then
+        # shellcheck disable=SC1090
+        source "$CUSTOM_CONFIG" 2>/dev/null || true
+    fi
+elif [[ -f "$DEFAULT_CONFIG" ]]; then
+    # shellcheck disable=SC1091
+    source "$DEFAULT_CONFIG" 2>/dev/null || true
+fi
+
+# Validate config values — warnings for invalid keys, resets to defaults
+validate_config
+
+# Second pass: parse CLI args (highest priority — overrides config values)
+CLI_ARGS=()
+SKIP_NEXT=false
+for arg in "$@"; do
+    if [[ "$SKIP_NEXT" == true ]]; then
+        SKIP_NEXT=false
+        continue
+    fi
+    case "$arg" in
+        --config=*) ;;
+        --config)  SKIP_NEXT=true ;;
+        --dry-run) DRY_RUN=true ;;
+        --no-dry-run) DRY_RUN=false ;;
+        --yes|--confirm|-y) YES_MODE=true ;;
+        *) CLI_ARGS+=("$arg") ;;
+    esac
+done
+
+set -- "${CLI_ARGS[@]}"
+
+# Root check (most operations need root)
+require_root
+
+print_dry_run_banner
+print_yes_banner
+
+# Create config directory
+ensure_dir "$CONFIG_DIR" 2>/dev/null || true
+
+# First-run welcome
+if [[ ! -f "${CONFIG_DIR}/.first-run" ]]; then
+    echo ""
+    print_box_header "Welcome to drive-nmonit v${VERSION}" 60
+    echo ""
+    echo "  This CLI manages your unified network-distributed storage."
+    echo "  It orchestrates all setup scripts through an interactive menu."
+    echo ""
+    echo "  Quick start:"
+    echo "    1. Install Dependencies"
+    echo "    2. Setup Local Pool (on ALL nodes)"
+    echo "    3. Init Cluster (on primary node)"
+    echo "    4. Join Cluster (on slave nodes)"
+    echo "    5. Mount Workspace (on ALL nodes)"
+    echo ""
+    echo "  Each step is described in the README.md"
+    echo ""
+    print_box_footer 60
+    echo ""
+    touch "${CONFIG_DIR}/.first-run"
+    _pause
+fi
+
+# Detect state once on startup
+detect_state
+
+# CLI or interactive mode?
+if [[ $# -gt 0 ]]; then
+    cli_mode "$@"
+else
+    while true; do
+        show_main_menu
+    done
+fi
