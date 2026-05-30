@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>drive-nmonit Cluster Dashboard</title>
+<style>
+/* ============================================================
+   CSS Reset & Base
+   ============================================================ */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg-primary:#0b0d17;
+  --bg-secondary:#111428;
+  --bg-card:#161a35;
+  --bg-card-hover:#1a1f3e;
+  --border-color:#252b4a;
+  --border-hover:#3a4170;
+  --text-primary:#e4e7f5;
+  --text-secondary:#888dad;
+  --text-muted:#5a5f85;
+  --green:#22c55e;
+  --green-bg:rgba(34,197,94,0.12);
+  --yellow:#f59e0b;
+  --yellow-bg:rgba(245,158,11,0.12);
+  --red:#ef4444;
+  --red-bg:rgba(239,68,68,0.12);
+  --blue:#3b82f6;
+  --blue-bg:rgba(59,130,246,0.1);
+  --offline:#6b7280;
+  --offline-bg:rgba(107,114,128,0.1);
+  --gradient-start:#0b0d17;
+  --gradient-mid:#0f1535;
+  --gradient-end:#121a3a;
+  --font-mono:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+  --radius:12px;
+  --radius-sm:8px;
+  --radius-xs:6px;
+  --shadow:0 4px 24px rgba(0,0,0,0.3),0 1px 4px rgba(0,0,0,0.2);
+  --transition:200ms cubic-bezier(0.4,0,0.2,1);
+}
+html{font-size:15px}
+body{
+  font-family:var(--font-sans);
+  background:var(--bg-primary);
+  color:var(--text-primary);
+  min-height:100vh;
+  line-height:1.5;
+  background-image:radial-gradient(ellipse at 20% 20%,rgba(59,130,246,0.04) 0%,transparent 50%),
+                   radial-gradient(ellipse at 80% 80%,rgba(139,92,246,0.03) 0%,transparent 50%);
+  background-attachment:fixed;
+}
+
+/* ============================================================
+   Header
+   ============================================================ */
+header{
+  padding:2rem 1.5rem 1rem;
+  max-width:1280px;
+  margin:0 auto;
+}
+.header-top{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:1rem;
+  margin-bottom:1.5rem;
+}
+.header-title{display:flex;align-items:center;gap:0.75rem}
+.header-title h1{
+  font-size:1.35rem;
+  font-weight:700;
+  background:linear-gradient(135deg,#e4e7f5 0%,#818cf8 100%);
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+.header-badge{
+  font-size:0.65rem;
+  padding:0.2rem 0.55rem;
+  border-radius:999px;
+  background:var(--bg-card);
+  border:1px solid var(--border-color);
+  color:var(--text-secondary);
+  font-family:var(--font-mono);
+  text-transform:uppercase;
+  letter-spacing:0.06em;
+}
+.header-controls{
+  display:flex;
+  align-items:center;
+  gap:0.75rem;
+}
+.refresh-btn{
+  display:inline-flex;
+  align-items:center;
+  gap:0.4rem;
+  padding:0.45rem 1rem;
+  border-radius:var(--radius-xs);
+  background:var(--bg-card);
+  border:1px solid var(--border-color);
+  color:var(--text-secondary);
+  font-size:0.8rem;
+  cursor:pointer;
+  transition:var(--transition);
+  font-family:var(--font-sans);
+}
+.refresh-btn:hover{
+  background:var(--bg-card-hover);
+  border-color:var(--border-hover);
+  color:var(--text-primary);
+}
+.refresh-btn:active{transform:scale(0.97)}
+.refresh-btn .spinner{display:inline-block;width:14px;height:14px}
+.refresh-btn.loading .spinner{animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ============================================================
+   Cluster Status Bar
+   ============================================================ */
+.cluster-bar{
+  display:grid;
+  grid-template-columns:auto repeat(4,1fr);
+  gap:1rem;
+  background:var(--bg-card);
+  border:1px solid var(--border-color);
+  border-radius:var(--radius);
+  padding:1.25rem 1.5rem;
+  backdrop-filter:blur(12px);
+  box-shadow:var(--shadow);
+}
+.cluster-bar .bar-label{
+  font-size:0.7rem;
+  text-transform:uppercase;
+  letter-spacing:0.08em;
+  color:var(--text-muted);
+  margin-bottom:0.15rem;
+}
+.cluster-bar .bar-value{
+  font-size:1.25rem;
+  font-weight:700;
+  font-family:var(--font-mono);
+}
+.cluster-bar .bar-unit{
+  font-size:0.75rem;
+  color:var(--text-secondary);
+  font-weight:400;
+}
+.cluster-stat{text-align:right}
+.cluster-stat .bar-label{text-align:right}
+.cluster-stat.total{text-align:left}
+.cluster-stat.total .bar-value{color:var(--text-primary)}
+.cluster-stat.healthy .bar-value{color:var(--green)}
+.cluster-stat.warning .bar-value{color:var(--yellow)}
+.cluster-stat.critical .bar-value{color:var(--red)}
+.cluster-stat.offline .bar-value{color:var(--offline)}
+
+/* ============================================================
+   Node Grid
+   ============================================================ */
+main{max-width:1280px;margin:0 auto;padding:1rem 1.5rem 2rem}
+.node-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+  gap:1rem;
+  margin-top:0.5rem;
+}
+
+/* ============================================================
+   Node Card
+   ============================================================ */
+.node-card{
+  background:var(--bg-card);
+  border:1px solid var(--border-color);
+  border-radius:var(--radius);
+  padding:1.25rem;
+  transition:var(--transition);
+  position:relative;
+  overflow:hidden;
+}
+.node-card::before{
+  content:'';
+  position:absolute;
+  top:0;left:0;right:0;
+  height:3px;
+  transition:var(--transition);
+}
+.node-card.status-healthy::before{background:var(--green)}
+.node-card.status-healthy{border-color:rgba(34,197,94,0.2)}
+.node-card.status-warning::before{background:var(--yellow)}
+.node-card.status-warning{border-color:rgba(245,158,11,0.2)}
+.node-card.status-critical::before{background:var(--red)}
+.node-card.status-critical{border-color:rgba(239,68,68,0.2)}
+.node-card.status-offline::before{background:var(--offline)}
+.node-card.status-offline{border-color:rgba(107,114,128,0.15)}
+.node-card:hover{
+  background:var(--bg-card-hover);
+  transform:translateY(-2px);
+  box-shadow:var(--shadow);
+  border-color:var(--border-hover);
+}
+
+/* Card Header */
+.card-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:1rem;
+}
+.card-node-info{display:flex;align-items:center;gap:0.65rem;min-width:0}
+.dot{
+  width:10px;height:10px;
+  border-radius:50%;
+  flex-shrink:0;
+  position:relative;
+}
+.dot.healthy{background:var(--green);box-shadow:0 0 8px rgba(34,197,94,0.5)}
+.dot.warning{background:var(--yellow);box-shadow:0 0 8px rgba(245,158,11,0.5)}
+.dot.critical{background:var(--red);box-shadow:0 0 8px rgba(239,68,68,0.5)}
+.dot.offline{background:var(--offline);box-shadow:0 0 4px rgba(107,114,128,0.3)}
+.dot.pulse{animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{
+  0%,100%{transform:scale(1);opacity:1}
+  50%{transform:scale(1.4);opacity:0.6}
+}
+.card-node-name{
+  font-weight:600;
+  font-size:0.95rem;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.card-node-label{
+  font-size:0.7rem;
+  color:var(--text-muted);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.card-timestamp{
+  font-size:0.65rem;
+  color:var(--text-muted);
+  font-family:var(--font-mono);
+  white-space:nowrap;
+  flex-shrink:0;
+}
+.card-timestamp.stale{color:var(--yellow)}
+
+/* Card Body */
+.card-body{display:flex;flex-direction:column;gap:0.75rem}
+
+/* Stat rows */
+.card-stats{display:grid;grid-template-columns:1fr 1fr;gap:0.5rem}
+.stat-item{
+  background:rgba(0,0,0,0.2);
+  border-radius:var(--radius-xs);
+  padding:0.5rem 0.65rem;
+}
+.stat-label{
+  font-size:0.65rem;
+  text-transform:uppercase;
+  letter-spacing:0.05em;
+  color:var(--text-muted);
+  margin-bottom:0.1rem;
+}
+.stat-value{
+  font-size:0.85rem;
+  font-weight:600;
+  font-family:var(--font-mono);
+}
+.stat-value.good{color:var(--green)}
+.stat-value.warn{color:var(--yellow)}
+.stat-value.bad{color:var(--red)}
+
+/* Disk usage bar */
+.disk-bar-section{margin-top:0.15rem}
+.disk-bar-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:0.3rem;
+}
+.disk-bar-label{
+  font-size:0.65rem;
+  text-transform:uppercase;
+  letter-spacing:0.05em;
+  color:var(--text-muted);
+}
+.disk-bar-pct{
+  font-size:0.75rem;
+  font-family:var(--font-mono);
+  font-weight:600;
+}
+.disk-bar-track{
+  height:6px;
+  background:rgba(0,0,0,0.3);
+  border-radius:99px;
+  overflow:hidden;
+}
+.disk-bar-fill{
+  height:100%;
+  border-radius:99px;
+  transition:width 0.8s cubic-bezier(0.4,0,0.2,1);
+  background:var(--green);
+}
+.disk-bar-fill.warning{background:linear-gradient(90deg,var(--yellow),#d97706)}
+.disk-bar-fill.critical{background:linear-gradient(90deg,var(--red),#dc2626)}
+
+/* Alerts */
+.alerts-section{margin-top:0.15rem}
+.alerts-header{
+  font-size:0.65rem;
+  text-transform:uppercase;
+  letter-spacing:0.05em;
+  color:var(--text-muted);
+  margin-bottom:0.35rem;
+}
+.alert-item{
+  display:flex;
+  align-items:flex-start;
+  gap:0.4rem;
+  padding:0.35rem 0.5rem;
+  border-radius:var(--radius-xs);
+  font-size:0.75rem;
+  line-height:1.4;
+  margin-bottom:0.2rem;
+}
+.alert-item:last-child{margin-bottom:0}
+.alert-item.critical{background:var(--red-bg);color:#fca5a5}
+.alert-item.warning{background:var(--yellow-bg);color:#fcd34d}
+.alert-item .alert-icon{flex-shrink:0;margin-top:0.05rem}
+.alert-item .alert-msg{word-break:break-word}
+
+/* Skeleton loading */
+.node-card.skeleton .card-header .dot{opacity:0.3}
+.node-card.skeleton .stat-value,.node-card.skeleton .disk-bar-fill,.node-card.skeleton .card-node-label{
+  animation:shimmer 1.5s ease-in-out infinite;
+}
+@keyframes shimmer{
+  0%,100%{opacity:0.4}
+  50%{opacity:0.7}
+}
+
+/* Empty / error */
+.no-data{
+  grid-column:1/-1;
+  text-align:center;
+  padding:3rem 1.5rem;
+  color:var(--text-muted);
+  background:var(--bg-card);
+  border:1px dashed var(--border-color);
+  border-radius:var(--radius);
+}
+.no-data .big-icon{font-size:2.5rem;margin-bottom:0.75rem;display:block}
+.no-data p{font-size:0.9rem;margin-bottom:0.25rem}
+.no-data .sub{font-size:0.75rem;color:var(--text-muted)}
+
+/* ============================================================
+   Footer
+   ============================================================ */
+footer{
+  max-width:1280px;
+  margin:0 auto;
+  padding:1rem 1.5rem 2rem;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:0.5rem;
+  font-size:0.75rem;
+  color:var(--text-muted);
+  border-top:1px solid var(--border-color);
+  padding-top:1.25rem;
+}
+.footer-left{display:flex;align-items:center;gap:1rem}
+.footer-right{display:flex;align-items:center;gap:0.5rem}
+.countdown-ring{width:18px;height:18px;position:relative}
+.countdown-ring svg{transform:rotate(-90deg)}
+.countdown-ring .bg{fill:none;stroke:var(--border-color);stroke-width:2.5}
+.countdown-ring .fg{
+  fill:none;
+  stroke:var(--blue);
+  stroke-width:2.5;
+  stroke-linecap:round;
+  transition:stroke-dashoffset 0.5s linear;
+}
+.countdown-text{
+  position:absolute;
+  inset:0;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:0.6rem;
+  font-family:var(--font-mono);
+  color:var(--text-secondary);
+}
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+@media(max-width:768px){
+  .header-top{flex-direction:column;align-items:flex-start}
+  .cluster-bar{grid-template-columns:1fr 1fr;gap:0.75rem;padding:1rem}
+  .cluster-stat.total{grid-column:1/-1;text-align:center}
+  .cluster-stat{text-align:center}
+  .node-grid{grid-template-columns:1fr}
+  footer{flex-direction:column;text-align:center;gap:0.5rem}
+  header{padding:1.25rem 1rem 0.75rem}
+  main{padding:0.75rem 1rem 1.5rem}
+}
+@media(max-width:480px){
+  .card-stats{grid-template-columns:1fr}
+  .cluster-bar{grid-template-columns:1fr 1fr;gap:0.5rem;padding:0.75rem}
+  html{font-size:14px}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-top">
+    <div class="header-title">
+      <h1>drive-nmonit</h1>
+      <span class="header-badge">Cluster Dashboard</span>
+    </div>
+    <div class="header-controls">
+      <button class="refresh-btn" id="refreshBtn" onclick="refreshData()">
+        <svg class="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <path d="M23 12a11 11 0 0 1-22 0 11 11 0 0 1 22 0Z" stroke-dasharray="60 100"/>
+        </svg>
+        Refresh
+      </button>
+    </div>
+  </div>
+
+  <div class="cluster-bar" id="clusterBar">
+    <div class="cluster-stat total">
+      <div class="bar-label">Cluster Status</div>
+      <div class="bar-value" id="clusterStatus">—</div>
+    </div>
+    <div class="cluster-stat healthy">
+      <div class="bar-label">Healthy</div>
+      <div class="bar-value"><span id="healthyCount">0</span></div>
+    </div>
+    <div class="cluster-stat warning">
+      <div class="bar-label">Warning</div>
+      <div class="bar-value"><span id="warningCount">0</span></div>
+    </div>
+    <div class="cluster-stat critical">
+      <div class="bar-label">Critical</div>
+      <div class="bar-value"><span id="criticalCount">0</span></div>
+    </div>
+    <div class="cluster-stat offline">
+      <div class="bar-label">Offline</div>
+      <div class="bar-value"><span id="offlineCount">0</span></div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="node-grid" id="nodeGrid"></div>
+</main>
+
+<footer>
+  <div class="footer-left">
+    <span>Last updated: <strong id="lastUpdated">—</strong></span>
+    <span id="nodeCount">0 nodes</span>
+  </div>
+  <div class="footer-right">
+    <div class="countdown-ring">
+      <svg viewBox="0 0 20 20" width="18" height="18">
+        <circle class="bg" cx="10" cy="10" r="8"/>
+        <circle class="fg" id="countdownCircle" cx="10" cy="10" r="8"
+                stroke-dasharray="50.265" stroke-dashoffset="0"/>
+      </svg>
+      <span class="countdown-text" id="countdownText">30</span>
+    </div>
+    <span>auto-refresh</span>
+  </div>
+</footer>
+
+<script>
+// ================================================================
+// drive-nmonit Dashboard — Client-Side Logic
+// ================================================================
+
+const API_BASE = '/api';
+const REFRESH_INTERVAL = 30; // seconds
+const CIRCUMFERENCE = 2 * Math.PI * 8; // ~50.265
+
+let countdown = REFRESH_INTERVAL;
+let countdownTimer = null;
+let refreshTimer = null;
+let isLoading = false;
+
+// Initialize
+document.addEventListener('DOMContentLoaded', () => {
+  fetchData();
+  startCountdown();
+});
+
+// ================================================================
+// Data Fetching
+// ================================================================
+
+async function fetchData() {
+  if (isLoading) return;
+  isLoading = true;
+  document.getElementById('refreshBtn').classList.add('loading');
+
+  try {
+    const res = await fetch(`${API_BASE}/health.json`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderDashboard(data);
+  } catch (err) {
+    console.error('Failed to fetch health data:', err);
+    showError(`Connection error: ${err.message}`);
+  } finally {
+    isLoading = false;
+    document.getElementById('refreshBtn').classList.remove('loading');
+  }
+}
+
+async function refreshData() {
+  countdown = REFRESH_INTERVAL;
+  updateCountdownDisplay();
+  await fetchData();
+  resetCountdown();
+}
+
+// ================================================================
+// Rendering
+// ================================================================
+
+function renderDashboard(data) {
+  // Cluster bar
+  const clusterStatus = document.getElementById('clusterStatus');
+  const statusText = data.cluster_status || 'unknown';
+  clusterStatus.textContent = statusText.charAt(0).toUpperCase() + statusText.slice(1);
+  clusterStatus.style.color = getStatusColor(data.cluster_status);
+
+  document.getElementById('healthyCount').textContent = data.healthy_nodes ?? 0;
+  document.getElementById('warningCount').textContent = data.warning_nodes ?? 0;
+  document.getElementById('criticalCount').textContent = data.critical_nodes ?? 0;
+  document.getElementById('offlineCount').textContent = data.offline_nodes ?? 0;
+
+  // Last updated
+  const generated = data.generated_at;
+  if (generated) {
+    const d = new Date(generated);
+    document.getElementById('lastUpdated').textContent = d.toLocaleTimeString();
+  }
+
+  // Node count
+  document.getElementById('nodeCount').textContent = `${data.total_nodes ?? 0} nodes`;
+
+  // Node cards
+  const grid = document.getElementById('nodeGrid');
+  grid.innerHTML = '';
+
+  if (!data.nodes || data.nodes.length === 0) {
+    grid.innerHTML = '<div class="no-data"><span class="big-icon">📡</span><p>No nodes connected</p><p class="sub">Configure nodes in /etc/drive-nmonit/nodes.conf</p></div>';
+    return;
+  }
+
+  for (const node of data.nodes) {
+    const card = createNodeCard(node);
+    grid.appendChild(card);
+  }
+}
+
+function createNodeCard(node) {
+  const card = document.createElement('div');
+  const status = node.status || 'offline';
+  card.className = `node-card status-${status}`;
+
+  const data = node.data || {};
+  const alerts = data.alerts || [];
+  const age = node.age_seconds ?? -1;
+  const isStale = age > 60;
+
+  // Timestamp
+  let timeStr = '—';
+  if (node.timestamp && node.timestamp > 0) {
+    const d = new Date(node.timestamp * 1000);
+    timeStr = d.toLocaleTimeString();
+    if (isStale) timeStr += ' ⚠';
+  }
+
+  // Disk usage — use the new dedicated field from health check JSON
+  let diskPct = data.disk_usage_pct;
+  let diskDisplay = '—';
+  if (diskPct != null && diskPct > 0) {
+    diskDisplay = `${diskPct}%`;
+  } else if (diskPct === 0) {
+    // 0% is valid — healthy
+    diskDisplay = '0%';
+  } else {
+    // Fallback: try to extract from alerts
+    for (const a of alerts) {
+      const m = a.message || '';
+      const match = m.match(/(\d+)%/);
+      if (match) {
+        const pct = parseInt(match[1]);
+        if (diskPct === null || pct > diskPct) {
+          diskPct = pct;
+        }
+      }
+    }
+    if (diskPct !== null) diskDisplay = `${diskPct}%`;
+  }
+
+  let diskClass = 'good';
+  if (diskPct !== null) {
+    if (diskPct >= 90) diskClass = 'critical';
+    else if (diskPct >= 80) diskClass = 'warning';
+    diskDisplay = `${diskPct}%`;
+  }
+
+  // Volume status
+  let volStatus = data.volume_status || (data.status === 'healthy' ? 'Started' : 'Unknown');
+  let volClass = volStatus === 'Started' ? 'good' : 'bad';
+
+  // Bricks
+  let brickCount = data.brick_count;
+  let brickInfo = (brickCount != null && brickCount > 0) ? `${brickCount} bricks` : '—';
+  
+  // Memory
+  let memTotal = data.memory_total_mb;
+  let memAvail = data.memory_avail_mb;
+  let memPct = data.memory_pct;
+  let memDisplay = '—';
+  if (memPct != null) {
+    memDisplay = `${memPct}% (${memAvail || '?'}MB free)`;
+  }
+  
+  // CPU
+  let cpuLoad = data.cpu_load_1m;
+  let cpuCores = data.cpu_cores;
+  let cpuDisplay = '—';
+  if (cpuLoad) {
+    cpuDisplay = cpuCores ? `${cpuLoad} / ${cpuCores} cores` : `${cpuLoad}`;
+  }
+
+  // Peer info from alerts
+  let peerCount = 0;
+  let peerDisconnected = 0;
+  for (const a of alerts) {
+    const m = a.message || '';
+    if (m.includes('peer') && m.includes('disconnected')) peerDisconnected++;
+    if (m.includes('Total peers')) {
+      const match = m.match(/(\d+)/);
+      if (match) peerCount = parseInt(match[1]);
+    }
+  }
+  // If no explicit peer info, show from gluster pool
+  if (peerCount === 0 && data.status === 'healthy') peerCount = 1; // self
+
+  // Build card HTML
+  const dotPulse = (status === 'healthy' || status === 'warning' || status === 'critical') ? 'pulse' : '';
+
+  card.innerHTML = `
+    <div class="card-header">
+      <div class="card-node-info">
+        <span class="dot ${status} ${dotPulse}"></span>
+        <div>
+          <div class="card-node-name">${escapeHtml(node.hostname)}</div>
+          <div class="card-node-label">${escapeHtml(node.label || '')}${node.hostname === (node.label || node.hostname) ? '' : ''}</div>
+        </div>
+      </div>
+      <div class="card-timestamp ${isStale ? 'stale' : ''}">${timeStr}</div>
+    </div>
+    <div class="card-body">
+      <div class="card-stats">
+        <div class="stat-item">
+          <div class="stat-label">Volume</div>
+          <div class="stat-value ${volClass}">${escapeHtml(volStatus)}</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-label">Bricks</div>
+          <div class="stat-value">${escapeHtml(brickInfo)}</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-label">Memory</div>
+          <div class="stat-value">${memDisplay}</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-label">CPU Load</div>
+          <div class="stat-value">${cpuDisplay}</div>
+        </div>
+      </div>
+
+      <div class="disk-bar-section">
+        <div class="disk-bar-header">
+          <span class="disk-bar-label">Disk Usage</span>
+          <span class="disk-bar-pct ${diskClass}">${diskDisplay}</span>
+        </div>
+        <div class="disk-bar-track">
+          <div class="disk-bar-fill ${diskClass}" style="width:${diskPct !== null ? Math.min(diskPct, 100) : 0}%"></div>
+        </div>
+      </div>
+
+      ${alerts.length > 0 ? `
+      <div class="alerts-section">
+        <div class="alerts-header">Alerts (${alerts.length})</div>
+        ${alerts.slice(0, 3).map(a => `
+        <div class="alert-item ${a.level}">
+          <span class="alert-icon">${a.level === 'critical' ? '🔴' : '🟡'}</span>
+          <span class="alert-msg">${escapeHtml(a.message)}</span>
+        </div>
+        `).join('')}
+        ${alerts.length > 3 ? `<div style="font-size:0.7rem;color:var(--text-muted);text-align:center;padding-top:0.2rem">+${alerts.length - 3} more alerts</div>` : ''}
+      </div>
+      ` : data.status === 'offline' ? `
+      <div class="alerts-section">
+        <div class="alert-item critical">
+          <span class="alert-icon">🔴</span>
+          <span class="alert-msg">Node unreachable — no health data available</span>
+        </div>
+      </div>
+      ` : `
+      <div class="alerts-section">
+        <div style="font-size:0.75rem;color:var(--green);padding:0.25rem 0;display:flex;align-items:center;gap:0.35rem">
+          <span>✓</span>
+          <span>All checks passed</span>
+        </div>
+      </div>
+      `}
+    </div>
+  `;
+
+  // Add click to expand/collapse for alerts if there are more than 3
+  if (alerts.length > 3) {
+    const alertSection = card.querySelector('.alerts-section');
+    alertSection.style.cursor = 'pointer';
+    alertSection.addEventListener('click', () => {
+      const allAlerts = alerts.map(a => `
+        <div class="alert-item ${a.level}">
+          <span class="alert-icon">${a.level === 'critical' ? '🔴' : '🟡'}</span>
+          <span class="alert-msg">${escapeHtml(a.message)}</span>
+        </div>
+      `).join('');
+      const expanded = alertSection.querySelector('.alert-item:not(:first-child)');
+      if (expanded) {
+        // Collapse back to 3
+        alertSection.innerHTML = `
+          <div class="alerts-header">Alerts (${alerts.length})</div>
+          ${alerts.slice(0, 3).map(a => `
+          <div class="alert-item ${a.level}">
+            <span class="alert-icon">${a.level === 'critical' ? '🔴' : '🟡'}</span>
+            <span class="alert-msg">${escapeHtml(a.message)}</span>
+          </div>
+          `).join('')}
+          <div style="font-size:0.7rem;color:var(--text-muted);text-align:center;padding-top:0.2rem">+${alerts.length - 3} more alerts (click to expand)</div>
+        `;
+      } else {
+        alertSection.innerHTML = `
+          <div class="alerts-header">Alerts (${alerts.length})</div>
+          ${allAlerts}
+          <div style="font-size:0.7rem;color:var(--text-muted);text-align:center;padding-top:0.2rem">Click to collapse</div>
+        `;
+      }
+    });
+  }
+
+  // Animate disk bar on entry
+  requestAnimationFrame(() => {
+    const bar = card.querySelector('.disk-bar-fill');
+    if (bar) {
+      const w = bar.style.width;
+      bar.style.width = '0%';
+      requestAnimationFrame(() => {
+        bar.style.width = w;
+      });
+    }
+  });
+
+  return card;
+}
+
+function showError(msg) {
+  const grid = document.getElementById('nodeGrid');
+  grid.innerHTML = `
+    <div class="no-data">
+      <span class="big-icon">⚠️</span>
+      <p>${escapeHtml(msg)}</p>
+      <p class="sub">Make sure the dashboard server is running with sudo permissions</p>
+    </div>
+  `;
+}
+
+// ================================================================
+// Countdown & Auto-Refresh
+// ================================================================
+
+function startCountdown() {
+  countdownTimer = setInterval(() => {
+    countdown--;
+    if (countdown <= 0) {
+      countdown = REFRESH_INTERVAL;
+      fetchData();
+    }
+    updateCountdownDisplay();
+  }, 1000);
+
+  refreshTimer = setInterval(() => {
+    // Safety net: also check every 30s
+  }, REFRESH_INTERVAL * 1000);
+}
+
+function resetCountdown() {
+  countdown = REFRESH_INTERVAL;
+  updateCountdownDisplay();
+}
+
+function updateCountdownDisplay() {
+  const text = document.getElementById('countdownText');
+  const circle = document.getElementById('countdownCircle');
+  text.textContent = countdown;
+  const offset = CIRCUMFERENCE * (1 - countdown / REFRESH_INTERVAL);
+  circle.setAttribute('stroke-dashoffset', offset);
+}
+
+// ================================================================
+// Utilities
+// ================================================================
+
+function getStatusColor(status) {
+  switch (status) {
+    case 'healthy': return 'var(--green)';
+    case 'warning': return 'var(--yellow)';
+    case 'critical': return 'var(--red)';
+    default: return 'var(--offline)';
+  }
+}
+
+function escapeHtml(str) {
+  if (str == null) return '';
+  const div = document.createElement('div');
+  div.textContent = String(str);
+  return div.innerHTML;
+}
+</script>
+</body>
+</html>
