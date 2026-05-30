@@ -1,0 +1,17 @@
+[Unit]
+Description=drive-nmonit Cluster Health Check
+Documentation=https://github.com/drive-nmonit
+After=network-online.target glusterd.service
+Wants=network-online.target glusterd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/drive-nmonit-health-check
+ExecStartPost=/bin/bash -c 'test -f /tmp/drive-nmonit-health.json && cp /tmp/drive-nmonit-health.json /var/log/drive-nmonit/health-latest.json || true'
+StandardOutput=journal
+StandardError=journal
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
