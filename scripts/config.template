@@ -1,0 +1,48 @@
+# =============================================================================
+# drive-nmonit — Persistent Configuration File
+# =============================================================================
+# This file is sourced by drive-nmonit-cli at startup. It sets default flag
+# values that apply every time the CLI is used. Command-line flags always
+# override values set here.
+#
+# Install:
+#   sudo cp scripts/config.template /etc/drive-nmonit/config
+#   sudo nano /etc/drive-nmonit/config
+#
+# Location: /etc/drive-nmonit/config
+# Format:   KEY=VALUE (bash-compatible, one per line)
+#           Lines starting with # are comments.
+#           Unquoted values, no spaces around =.
+#
+# Valid values are validated at startup — invalid entries produce a warning
+# and are silently reset to their defaults. Only exact true/false (lowercase)
+# is accepted. Values like yes, 1, TRUE, True will trigger warnings.
+# =============================================================================
+
+# --- Global Flags ---
+
+# Dry-run mode: preview what commands would be run without executing them.
+# Equivalent to passing --dry-run on the command line.
+# Valid values: true, false  (default: false)
+# DRY_RUN=true
+
+# Auto-confirm mode: automatically answer all confirmation prompts with
+# their defaults. Equivalent to passing --yes, --confirm, or -y.
+# Valid values: true, false  (default: false)
+# YES_MODE=true
+
+# =============================================================================
+# Examples
+# =============================================================================
+#
+# # Always preview changes before making them:
+# DRY_RUN=true
+#
+# # Run automation scripts without interactive prompts:
+# YES_MODE=true
+#
+# # Combined: safe, non-interactive automation:
+# DRY_RUN=true
+# YES_MODE=true
+#
+# =============================================================================
