@@ -1,0 +1,18 @@
+[Unit]
+Description=drive-nmonit Periodic Health Check Timer
+Documentation=https://github.com/drive-nmonit
+After=network-online.target glusterd.service
+
+[Timer]
+# Run 5 minutes after boot (or after timer enable on a running system), then every 5 minutes
+OnBootSec=5min
+OnStartupSec=5min
+OnUnitActiveSec=5min
+# Randomize start within the interval to avoid thundering herd on cluster
+RandomizedDelaySec=30s
+# Persist missed runs (e.g., if system was powered off)
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
